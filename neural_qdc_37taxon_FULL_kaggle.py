@@ -9,7 +9,7 @@
 # =====================================================================
 
 # ---------------- setup ----------------
-import subprocess, sys
+import subprocess, sys, os
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "torch_geometric"], check=True)
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "dendropy"], check=True)
 import shutil
