@@ -9,10 +9,17 @@
 # =====================================================================
 
 # ---------------- setup ----------------
-!pip -q install torch_geometric
-!pip -q install dendropy
-!apt-get -qq install -y default-jre-headless 2>/dev/null
-!git clone -q --depth 1 https://github.com/Mahim1997/wQFM-2020.git /kaggle/working/wQFM-2020
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "torch_geometric"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "dendropy"], check=True)
+import shutil
+if not shutil.which("java"):
+    subprocess.run(["apt-get", "update", "-qq"])
+    subprocess.run(["apt-get", "-qq", "install", "-y", "--fix-missing", "default-jre-headless"])
+if not os.path.exists("/kaggle/working/wQFM-2020"):
+    subprocess.run(["git", "clone", "-q", "--depth", "1",
+                    "https://github.com/Mahim1997/wQFM-2020.git",
+                    "/kaggle/working/wQFM-2020"], check=True)
 WQFM = "/kaggle/working/wQFM-2020"; JAR = "wQFM-v1.4.jar"
 
 # ---------------- imports ----------------
@@ -26,7 +33,13 @@ from itertools import combinations
 from collections import defaultdict
 import numpy as np
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+dev = 'cpu'
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability()
+    if major >= 7:   # sm_70+ required by modern PyTorch (P100=sm_60 fails)
+        dev = 'cuda'
+    else:
+        print(f"GPU sm_{major}{minor} incompatible with this PyTorch, falling back to CPU")
 print("device:", dev)
 
 # ---------------- locate data ----------------
@@ -67,8 +80,10 @@ def qcounts(trees):
             r=[g(a,b)+g(cc,d), g(a,cc)+g(b,d), g(a,d)+g(b,cc)]
             c[(a,b,cc,d)][_res((a,b,cc,d))[r.index(min(r))]]+=1
     return c
-def counts_37(cond, rep):                      # -> (QD_E counts, QD_T counts)
+def counts_37(cond, rep, skip_true=False):     # -> (QD_E counts, QD_T counts or None)
     est = load_trees(sorted(glob.glob(f"{ROOT}/{cond}/{rep}/*/raxmlboot.gtrgamma/RAxML_bipartitions.final.f200")))
+    if skip_true:
+        return qcounts(est), None
     tru = load_trees(sorted(glob.glob(f"{ROOT}/true-genetrees/mammalian-1X-truegt/1X-200-true/{rep}/*/true.gt")))
     return qcounts(est), qcounts(tru)
 
@@ -104,47 +119,72 @@ class NeuralQDC(nn.Module):
 # ---------------- build graphs (1X-200-250, R1..R12 ; train R1-R8, test R9-R12) ----------------
 COND = "1X-200-250"
 reps = [f"R{i}" for i in range(1,13)]
-store = {}
+GRAPH_CKPT = "/kaggle/working/graphs_checkpoint.pt"
+store = torch.load(GRAPH_CKPT) if os.path.exists(GRAPH_CKPT) else {}
 print("building graphs (~1.5 min each)...")
 for rep in reps:
-    qe,qt = counts_37(COND, rep)
-    store[rep] = (wqrts_to_graph(qe,qt), qe, qt)     # graphs stay on CPU
-    print("  ", rep, "done")
+    if rep in store:
+        print(f"  {rep} — loaded from checkpoint, skipping")
+        continue
+    qe, qt = counts_37(COND, rep)
+    store[rep] = (wqrts_to_graph(qe, qt), qe, qt)
+    torch.save(store, GRAPH_CKPT)          # save after every rep
+    print(f"  {rep} done + saved to checkpoint")
+print("all graphs ready.")
 train = [store[r][0] for r in reps[:8]]
 test  = [(r,)+store[r] for r in reps[8:]]
 print(f"{len(train)} train, {len(test)} test")
 
 # ---------------- train (one graph on GPU at a time) ----------------
+MODEL_CKPT = "/kaggle/working/model_checkpoint.pt"
+BEST_MODEL = "/kaggle/working/best_model.pt"
 model = NeuralQDC(hid=16, heads=2).to(dev)
-opt = torch.optim.Adam(model.parameters(), lr=0.002)
-best=1e9; best_state=None
-for ep in range(200):
-    model.train(); random.shuffle(train); tot=0
-    for g in train:
-        g=g.to(dev)
-        opt.zero_grad(); out=model(g.x,g.edge_index)
-        loss=F.mse_loss(out,g.y); loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step(); tot+=loss.item()
-        g=g.cpu(); torch.cuda.empty_cache()
-    model.eval(); gm=0
-    with torch.no_grad():
-        for _,g,_,_ in test:
-            g=g.to(dev); gm+=F.mse_loss(model(g.x,g.edge_index),g.y).item(); g=g.cpu()
-    gm/=len(test); torch.cuda.empty_cache()
-    if gm<best: best=gm; best_state={k:v.clone() for k,v in model.state_dict().items()}
-    if ep%25==0 or ep==199: print(f"epoch {ep:3d}  train {tot/len(train):.5f}  test {gm:.5f}")
-model.load_state_dict(best_state); print("trained.")
+if os.path.exists(BEST_MODEL):
+    # Training already completed in a previous run — load and skip
+    model.load_state_dict(torch.load(BEST_MODEL, map_location=dev))
+    print("CHECKPOINT: training already done — loaded best_model.pt, skipping training.")
+else:
+    opt = torch.optim.Adam(model.parameters(), lr=0.002)
+    best=1e9; best_state=None; start_ep=0
+    if os.path.exists(MODEL_CKPT):
+        ck = torch.load(MODEL_CKPT, map_location=dev)
+        model.load_state_dict(ck['model']); opt.load_state_dict(ck['opt'])
+        best=ck['best']; best_state=ck['best_state']; start_ep=ck['epoch']+1
+        print(f"Resumed training from epoch {start_ep}")
+    for ep in range(start_ep, 200):
+        model.train(); random.shuffle(train); tot=0
+        for g in train:
+            g=g.to(dev)
+            opt.zero_grad(); out=model(g.x,g.edge_index)
+            loss=F.mse_loss(out,g.y); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step(); tot+=loss.item()
+            g=g.cpu(); torch.cuda.empty_cache()
+        model.eval(); gm=0
+        with torch.no_grad():
+            for _,g,_,_ in test:
+                g=g.to(dev); gm+=F.mse_loss(model(g.x,g.edge_index),g.y).item(); g=g.cpu()
+        gm/=len(test); torch.cuda.empty_cache()
+        if gm<best: best=gm; best_state={k:v.clone() for k,v in model.state_dict().items()}
+        if ep%25==0 or ep==199: print(f"epoch {ep:3d}  train {tot/len(train):.5f}  test {gm:.5f}")
+        if ep%25==0:   # save mid-training checkpoint every 25 epochs
+            torch.save({'epoch':ep,'model':model.state_dict(),'opt':opt.state_dict(),
+                        'best':best,'best_state':best_state}, MODEL_CKPT)
+    model.load_state_dict(best_state)
+    torch.save(best_state, BEST_MODEL)   # save final best model weights
+    print("CHECKPOINT: training complete — best_model.pt saved.")
 
 # =====================================================================
 #  OUTPUT FILES  ·  QD_E , QD' , QD_T   (distribution + dominant + comparison)
 #  for one condition + replicate (choose below).  Saved to /kaggle/working.
 # =====================================================================
-OUT_COND = "1X-200-250"     # 1X-200-250 / 1X-200-500 / 1X-200-1000
-OUT_REP  = "R9"             # use a HELD-OUT replicate (R9-R12) for a fair result
-NGENES   = 200
+# 0.5X-200-500 has no true gene trees — skip_true=True
+OUT_COND   = "0.5X-200-500"
+OUT_REP    = "R9"
+NGENES     = 200
+HAS_TRUE   = False          # set True if condition has true gene trees
 
 print(f"\nwriting output files for {OUT_COND} {OUT_REP} ...")
-QDE, QDT = counts_37(OUT_COND, OUT_REP)
+QDE, QDT = counts_37(OUT_COND, OUT_REP, skip_true=not HAS_TRUE)
 
 def gnn_correct(counts):                        # QD_E -> QD' (as integer weights, prob*NGENES)
     keys=sorted(combinations(names,4))
@@ -178,31 +218,52 @@ def write_dominant(QD, path):
         for k in combinations(names,4):
             b=dominant(QD,k); f.write(f"{'{'+','.join(k)+'}':<26}{lab(b):<22}{QD[k].get(b,0)}\n")
 
-write_distribution(QDE,"estimated_quartet_distribution.txt"); write_dominant(QDE,"estimated_dominant_quartets.txt")
-write_distribution(QDP,"improved_quartet_distribution.txt");  write_dominant(QDP,"improved_dominant_quartets.txt")
-write_distribution(QDT,"true_quartet_distribution.txt");      write_dominant(QDT,"true_dominant_quartets.txt")
+# always write estimated + improved files
+write_distribution(QDE, "estimated_quartet_distribution.txt")
+write_dominant(QDE,      "estimated_dominant_quartets.txt")
+write_distribution(QDP,  "improved_quartet_distribution.txt")
+write_dominant(QDP,      "improved_dominant_quartets.txt")
+output_files = ["estimated_quartet_distribution.txt","estimated_dominant_quartets.txt",
+                "improved_quartet_distribution.txt","improved_dominant_quartets.txt"]
 
-# ---- comparison : dominant-quartet agreement with the truth ----
-allsets=list(combinations(names,4)); N=len(allsets); matchE=matchP=changed=0; rows=[]
-for k in allsets:
-    de=dominant(QDE,k); dp=dominant(QDP,k); dt=dominant(QDT,k)
-    me=(de==dt); mp=(dp==dt); matchE+=me; matchP+=mp
-    if de!=dp: changed+=1; rows.append((k,lab(de),lab(dp),lab(dt),me,mp))
+# true gene tree files only when available
+if HAS_TRUE and QDT is not None:
+    write_distribution(QDT, "true_quartet_distribution.txt")
+    write_dominant(QDT,     "true_dominant_quartets.txt")
+    output_files += ["true_quartet_distribution.txt","true_dominant_quartets.txt"]
+
+# comparison summary
+allsets=list(combinations(names,4)); N=len(allsets); changed=0; rows=[]
 with open("comparison_summary.txt","w") as f:
-    f.write("Neural-QDC : dominant-quartet agreement with the TRUE gene trees\n")
-    f.write(f"condition {OUT_COND}   replicate {OUT_REP}   total 4-taxon sets = {N}\n\n")
-    f.write(f"QD_E (estimated) dominant matches QD_T (true) : {matchE}/{N} = {100*matchE/N:.2f}%\n")
-    f.write(f"QD'  (GNN output) dominant matches QD_T (true): {matchP}/{N} = {100*matchP/N:.2f}%\n")
-    f.write(f"change in agreement                            : {100*(matchP-matchE)/N:+.2f} percentage points\n")
-    f.write(f"sets where GNN changed the dominant quartet    : {changed}\n\n")
-    f.write("--- sample of changed sets (set | QD_E dom | QD' dom | QD_T dom | E=T | '=T) ---\n")
-    for k,e,p,t,me,mp in rows[:50]:
-        f.write(f"{'{'+','.join(k)+'}':<24} {e:<16} {p:<16} {t:<16} {int(me)}   {int(mp)}\n")
+    f.write("Neural-QDC : QD_E vs GNN-corrected QD'\n")
+    f.write(f"condition {OUT_COND}   replicate {OUT_REP}   total 4-taxon sets = {N}\n")
+    f.write(f"NOTE: no true gene trees for {OUT_COND} — agreement vs truth not computed\n\n")
+    if HAS_TRUE and QDT is not None:
+        matchE=matchP=0
+        for k in allsets:
+            de=dominant(QDE,k); dp=dominant(QDP,k); dt=dominant(QDT,k)
+            me=(de==dt); mp=(dp==dt); matchE+=me; matchP+=mp
+            if de!=dp: changed+=1; rows.append((k,lab(de),lab(dp),lab(dt),me,mp))
+        f.write(f"QD_E matches QD_T : {matchE}/{N} = {100*matchE/N:.2f}%\n")
+        f.write(f"QD'  matches QD_T : {matchP}/{N} = {100*matchP/N:.2f}%\n")
+        f.write(f"change            : {100*(matchP-matchE)/N:+.2f} percentage points\n\n")
+        f.write("--- sample of changed sets (set | QD_E dom | QD' dom | QD_T dom | E=T | '=T) ---\n")
+        for k,e,p,t,me,mp in rows[:50]:
+            f.write(f"{'{'+','.join(k)+'}':<24} {e:<16} {p:<16} {t:<16} {int(me)}   {int(mp)}\n")
+    else:
+        for k in allsets:
+            de=dominant(QDE,k); dp=dominant(QDP,k)
+            if de!=dp: changed+=1; rows.append((k,lab(de),lab(dp)))
+        f.write(f"sets where GNN changed dominant quartet : {changed}/{N}\n\n")
+        f.write("--- sample of changed sets (set | QD_E dom | QD' dom) ---\n")
+        for k,e,p in rows[:50]:
+            f.write(f"{'{'+','.join(k)+'}':<24} {e:<16} {p:<16}\n")
+output_files.append("comparison_summary.txt")
 
 print("\n=== DONE ===")
-print(f"QD_E matches truth : {100*matchE/N:.2f}%")
-print(f"QD'  matches truth : {100*matchP/N:.2f}%   ({100*(matchP-matchE)/N:+.2f} pts)")
-for fn in ["estimated_quartet_distribution.txt","estimated_dominant_quartets.txt",
-           "improved_quartet_distribution.txt","improved_dominant_quartets.txt",
-           "true_quartet_distribution.txt","true_dominant_quartets.txt","comparison_summary.txt"]:
+print(f"GNN changed dominant quartet in {changed}/{N} sets ({100*changed/N:.2f}%)")
+for fn in output_files:
     print("  saved:", fn)
+with open("/kaggle/working/outputs_done.flag","w") as f:
+    f.write(f"outputs complete for {OUT_COND} {OUT_REP}\n")
+print("CHECKPOINT: all output files written — outputs_done.flag saved.")
