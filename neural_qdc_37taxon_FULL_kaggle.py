@@ -70,8 +70,10 @@ def load_trees(paths):
         try: tl.read(path=p,schema="newick")
         except Exception: pass
     return tl
+def _dd_int(): return defaultdict(int)   # top-level so pickle can serialize it
+
 def qcounts(trees):
-    c=defaultdict(lambda: defaultdict(int))
+    c=defaultdict(_dd_int)
     for gt in trees:
         pdm=gt.phylogenetic_distance_matrix(); tx={t.label:t for t in gt.taxon_namespace}
         for a,b,cc,d in combinations(names,4):
